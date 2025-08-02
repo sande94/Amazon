@@ -1,0 +1,324 @@
+`timescale 1ns/1ps
+import uvm_pkg::*;
+`include "pipeline_if.sv"
+
+//------------------------------------------------------------------------------
+// Transaction
+//------------------------------------------------------------------------------
+class pipeline_trans extends uvm_sequence_item;
+  rand bit [3:0]    pipeline_enable;
+  rand bit          valid;
+  rand bit [1:0]    cmd;
+  rand bit [7:0]    addr;
+  rand bit [31:0]   data_in;
+  bit [31:0]        data_out;
+
+  `uvm_object_utils(pipeline_trans)
+  function new(string name = "pipeline_trans");
+    super.new(name);
+  endfunction
+endclass
+
+//------------------------------------------------------------------------------
+// Sequencer
+//------------------------------------------------------------------------------
+class pipeline_sequencer extends uvm_sequencer#(pipeline_trans);
+  `uvm_component_utils(pipeline_sequencer)
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+endclass
+
+//------------------------------------------------------------------------------
+// Sequence
+//------------------------------------------------------------------------------
+class pipeline_sequence extends uvm_sequence#(pipeline_trans);
+  `uvm_object_utils(pipeline_sequence)
+  function new(string name = "pipeline_sequence");
+    super.new(name);
+  endfunction
+
+  task body();
+    pipeline_trans tr;
+    // Example: send a single transaction
+    tr = pipeline_trans::type_id::create("tr");
+    assert(tr.randomize() with {
+      pipeline_enable inside {[4'b0001:4'b1111]};
+      valid == 1;
+      cmd inside {[2'b00:2'b11]};
+      addr inside {[8'h00:8'hFF]};
+    });
+
+    start_item(tr);
+    finish_item(tr);
+  endtask
+endclass
+
+//------------------------------------------------------------------------------
+// Driver
+//------------------------------------------------------------------------------
+class pipeline_driver extends uvm_driver#(pipeline_trans);
+  `uvm_component_utils(pipeline_driver)
+
+  virtual pipeline_cfg_if.TB_CFG cfg_vif;
+  virtual pipeline_in_if.TB_DRV  in_vif;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual pipeline_cfg_if.TB_CFG)::get(this, "", "cfg_vif", cfg_vif))
+      `uvm_fatal("NOVIF","pipeline_driver: cfg_vif not found");
+    if (!uvm_config_db#(virtual pipeline_in_if.TB_DRV)::get(this, "", "in_vif", in_vif))
+      `uvm_fatal("NOVIF","pipeline_driver: in_vif not found");
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    pipeline_trans req;
+    phase.raise_objection(this);
+    forever begin
+      seq_item_port.get_next_item(req);
+      // Drive pipeline config
+      @(posedge cfg_vif.clk);
+      cfg_vif.pipeline_enable <= req.pipeline_enable;
+
+      // Drive input channel
+      if (req.valid) begin
+        @(posedge in_vif.clk);
+        in_vif.valid   <= 1;
+        in_vif.cmd     <= req.cmd;
+        in_vif.addr    <= req.addr;
+        in_vif.data_in <= req.data_in;
+        @(posedge in_vif.clk);
+        in_vif.valid   <= 0;
+      end
+      seq_item_port.item_done();
+    end
+    phase.drop_objection(this);
+  endtask
+endclass
+
+//------------------------------------------------------------------------------
+// Monitors
+//------------------------------------------------------------------------------
+class pipeline_in_monitor extends uvm_monitor;
+  `uvm_component_utils(pipeline_in_monitor)
+  virtual pipeline_in_if.MONITOR vif;
+  uvm_analysis_port#(pipeline_trans) ap;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    ap = uvm_analysis_port#(pipeline_trans)::type_id::create("ap", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual pipeline_in_if.MONITOR)::get(this, "", "vif", vif))
+      `uvm_fatal("NOVIF","pipeline_in_monitor: vif not found");
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    pipeline_trans tr;
+    forever @(posedge vif.clk) begin
+      if (vif.valid) begin
+        tr = pipeline_trans::type_id::create("tr");
+        tr.cmd     = vif.cmd;
+        tr.addr    = vif.addr;
+        tr.data_in = vif.data_in;
+        ap.write(tr);
+      end
+    end
+  endtask
+endclass
+
+class pipeline_out_monitor extends uvm_monitor;
+  `uvm_component_utils(pipeline_out_monitor)
+  virtual pipeline_out_if.MONITOR vif;
+  uvm_analysis_port#(pipeline_trans) ap;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    ap = uvm_analysis_port#(pipeline_trans)::type_id::create("ap", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual pipeline_out_if.MONITOR)::get(this, "", "vif", vif))
+      `uvm_fatal("NOVIF","pipeline_out_monitor: vif not found");
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    pipeline_trans tr;
+    forever @(posedge vif.clk) begin
+      if (vif.valid) begin
+        tr = pipeline_trans::type_id::create("tr");
+        tr.cmd      = vif.cmd;
+        tr.addr     = vif.addr;
+        tr.data_out = vif.data_out;
+        ap.write(tr);
+      end
+    end
+  endtask
+endclass
+
+//------------------------------------------------------------------------------
+// Scoreboard
+//------------------------------------------------------------------------------
+class pipeline_scoreboard extends uvm_component;
+  `uvm_component_utils(pipeline_scoreboard)
+
+  uvm_analysis_imp#(pipeline_trans, pipeline_scoreboard) in_imp;
+  uvm_analysis_imp#(pipeline_trans, pipeline_scoreboard) out_imp;
+  bit [31:0] expected_data[bit [7:0]];
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    in_imp  = uvm_analysis_imp#(pipeline_trans, pipeline_scoreboard)::type_id::create("in_imp", this);
+    out_imp = uvm_analysis_imp#(pipeline_trans, pipeline_scoreboard)::type_id::create("out_imp", this);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    // connected in env
+  endfunction
+
+  function void write(pipeline_trans tr); // in_imp
+    expected_data[tr.addr] = tr.data_in;
+  endfunction
+
+  function void write(pipeline_trans tr); // out_imp
+    bit [31:0] golden = expected_data[tr.addr] + 1;
+    if (tr.data_out === golden)
+      `uvm_info("SCOREBOARD",
+        $sformatf("PASS addr=0x%0h data_out=0x%0h", tr.addr, tr.data_out), UVM_LOW)
+    else
+      `uvm_error("SCOREBOARD",
+        $sformatf("FAIL addr=0x%0h got=0x%0h expected=0x%0h",
+                  tr.addr, tr.data_out, golden));
+    expected_data.delete(tr.addr);
+  endfunction
+endclass
+
+//------------------------------------------------------------------------------
+// Agent
+//------------------------------------------------------------------------------
+class pipeline_agent extends uvm_component;
+  `uvm_component_utils(pipeline_agent)
+  pipeline_sequencer   seqr;
+  pipeline_driver      driver;
+  pipeline_in_monitor  in_mon;
+  pipeline_out_monitor out_mon;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    seqr   = pipeline_sequencer::type_id::create("seqr", this);
+    driver = pipeline_driver::type_id::create("driver", this);
+    in_mon = pipeline_in_monitor::type_id::create("in_mon", this);
+    out_mon= pipeline_out_monitor::type_id::create("out_mon", this);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    driver.seq_item_port.connect(seqr.seq_item_export);
+  endfunction
+endclass
+
+//------------------------------------------------------------------------------
+// Environment
+//------------------------------------------------------------------------------
+class pipeline_env extends uvm_env;
+  `uvm_component_utils(pipeline_env)
+  pipeline_agent      agent;
+  pipeline_scoreboard sb;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    agent = pipeline_agent::type_id::create("agent", this);
+    sb    = pipeline_scoreboard::type_id::create("sb", this);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    agent.in_mon.ap.connect(sb.in_imp);
+    agent.out_mon.ap.connect(sb.out_imp);
+  endfunction
+endclass
+
+//------------------------------------------------------------------------------
+// Test
+//------------------------------------------------------------------------------
+class pipeline_test extends uvm_test;
+  `uvm_component_utils(pipeline_test)
+  pipeline_env env;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    env = pipeline_env::type_id::create("env", this);
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    pipeline_sequence seq;
+    seq = pipeline_sequence::type_id::create("seq");
+    seq.start(env.agent.seqr);
+  endtask
+endclass
+
+//------------------------------------------------------------------------------
+// Top-level
+//------------------------------------------------------------------------------
+module tb_top;
+  import uvm_pkg::*;
+  logic clk, rst_n;
+
+  // Clock generation
+  initial clk = 0;
+  always #5 clk = ~clk;  // 100MHz
+
+  // Reset
+  initial begin
+    rst_n = 0;
+    #20;
+    rst_n = 1;
+  end
+
+  // Interface instances
+  pipeline_cfg_if cfg_if(.clk(clk), .rst_n(rst_n));
+  pipeline_in_if in_if(.clk(clk), .rst_n(rst_n));
+  pipeline_out_if out_if(.clk(clk), .rst_n(rst_n));
+
+  // DUT instantiation (assumes ports match)
+  my_dut dut (
+    .clk              (clk),
+    .rst_n            (rst_n),
+    .pipeline_enable  (cfg_if.pipeline_enable),
+    .in_valid         (in_if.valid),
+    .in_cmd           (in_if.cmd),
+    .in_addr          (in_if.addr),
+    .in_data          (in_if.data_in),
+    .out_valid        (out_if.valid),
+    .out_cmd          (out_if.cmd),
+    .out_addr         (out_if.addr),
+    .out_data         (out_if.data_out)
+  );
+
+  // Configure virtual interfaces for UVM
+  initial begin
+    uvm_config_db#(virtual pipeline_cfg_if.TB_CFG)::set(null, "", "cfg_vif", cfg_if);
+    uvm_config_db#(virtual pipeline_in_if.TB_DRV)::set(null, "", "in_vif", in_if);
+    uvm_config_db#(virtual pipeline_in_if.MONITOR)::set(null, "", "vif", in_if);
+    uvm_config_db#(virtual pipeline_out_if.MONITOR)::set(null, "", "vif", out_if);
+
+    run_test();
+  end
+endmodule
