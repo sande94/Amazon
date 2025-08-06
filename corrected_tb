@@ -1,0 +1,128 @@
+`uvm_analysis_imp_decl(_in)
+`uvm_analysis_imp_decl(_out)
+--------------------------------------------------------------------------------------
+  class pipeline_in_monitor extends uvm_monitor;
+  `uvm_component_utils(pipeline_in_monitor)
+
+  virtual pipeline_in_if.MONITOR vif;
+  uvm_analysis_port #(pipeline_trans) master_mon2scb;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    master_mon2scb = new("master_mon2scb", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual pipeline_in_if.MONITOR)::get(this, "", "vif", vif))
+      `uvm_fatal("NOVIF", "pipeline_in_monitor: vif not found");
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    pipeline_trans tr;
+    forever @(posedge vif.clk) begin
+      if (vif.valid) begin
+        tr = pipeline_trans::type_id::create("tr");
+        tr.cmd     = vif.cmd;
+        tr.addr    = vif.addr;
+        tr.data_in = vif.data_in;
+        master_mon2scb.write(tr);
+      end
+    end
+  endtask
+endclass
+----------------------------------------------------------------------------------------------
+  class pipeline_out_monitor extends uvm_monitor;
+  `uvm_component_utils(pipeline_out_monitor)
+
+  virtual pipeline_out_if.MONITOR vif;
+  uvm_analysis_port #(pipeline_trans) slave_mon2scb;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    slave_mon2scb = new("slave_mon2scb", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual pipeline_out_if.MONITOR)::get(this, "", "vif", vif))
+      `uvm_fatal("NOVIF", "pipeline_out_monitor: vif not found");
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    pipeline_trans tr;
+    forever @(posedge vif.clk) begin
+      if (vif.valid) begin
+        tr = pipeline_trans::type_id::create("tr");
+        tr.cmd      = vif.cmd;
+        tr.addr     = vif.addr;
+        tr.data_out = vif.data_out;
+        slave_mon2scb.write(tr);
+      end
+    end
+  endtask
+endclass
+-------------------------------------------------------------------------------------------------------------------------
+  class pipeline_scoreboard extends uvm_component;
+  `uvm_component_utils(pipeline_scoreboard)
+
+  // Declare two analysis implementations with custom names
+  uvm_analysis_imp_master_mon2scb #(pipeline_trans, pipeline_scoreboard) m_mon2scb;
+  uvm_analysis_imp_slave_mon2scb  #(pipeline_trans, pipeline_scoreboard) s_mon2scb;
+
+  // Storage for expected values
+  bit [31:0] expected_data[bit [7:0]];
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    m_mon2scb = new("m_mon2scb", this);
+    s_mon2scb = new("s_mon2scb", this);
+  endfunction
+
+  // Master side: store expected data
+  function void write_master_mon2scb(pipeline_trans tr);
+    expected_data[tr.addr] = tr.data_in;
+    `uvm_info("SCOREBOARD",
+      $sformatf("Captured MASTER: addr=0x%0h data_in=0x%0h", tr.addr, tr.data_in),
+      UVM_LOW)
+  endfunction
+
+  // Slave side: compare actual output
+  function void write_slave_mon2scb(pipeline_trans tr);
+    bit [31:0] expected = expected_data.exists(tr.addr) ? expected_data[tr.addr] + 1 : 32'hDEAD_BEEF;
+
+    if (tr.data_out === expected)
+      `uvm_info("SCOREBOARD",
+        $sformatf("PASS: addr=0x%0h, data_out=0x%0h", tr.addr, tr.data_out),
+        UVM_LOW)
+    else
+      `uvm_error("SCOREBOARD",
+        $sformatf("FAIL: addr=0x%0h, got=0x%0h, expected=0x%0h",
+                  tr.addr, tr.data_out, expected));
+
+    expected_data.delete(tr.addr);
+  endfunction
+endclass
+--------------------------------------------------------------------------------------------------------------------------------
+  class pipeline_env extends uvm_env;
+  `uvm_component_utils(pipeline_env)
+
+  pipeline_agent       agent;
+  pipeline_scoreboard  sb;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    agent = pipeline_agent::type_id::create("agent", this);
+    sb    = pipeline_scoreboard::type_id::create("sb", this);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    agent.in_mon.master_mon2scb.connect(sb.m_mon2scb);
+    agent.out_mon.slave_mon2scb.connect(sb.s_mon2scb);
+  endfunction
+endclass
+----------------------------------------------------------------------------------------------------
